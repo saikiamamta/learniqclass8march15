@@ -1,29 +1,31 @@
 """
 LearnIQ v2 — CBSE Grade 8 Science AI Tutor
-Run: streamlit run learniq_v2.py
-Requires: .env file with OPENAI_API_KEY=sk-...
-PDFs: place all chapter PDFs in ./pdfs/ folder
+Streamlit Cloud compatible version
 """
 
-# ─── IMPORTS ───────────────────────────────────────────────────────────────
 import os, json, random, datetime, sqlite3, hashlib
 from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
 
 import streamlit as st
+
+# ── Streamlit Cloud: read secrets if available ──
+if hasattr(st, "secrets") and "OPENAI_API_KEY" in st.secrets:
+    os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+
 from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
-from langchain.schema import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 
 # ─── CONFIGURATION ─────────────────────────────────────────────────────────
-SUBJECT_LABEL = "CBSE Grade 8 Science"   # 🔁 change for different subject
+SUBJECT_LABEL = "CBSE Grade 8 Science"
 PDF_DIR       = "./pdfs"
-CHROMA_DIR    = "./chroma_db_v2"
+FAISS_DIR     = "./faiss_index"
 DB_PATH       = "./learniq_analytics.db"
 CHUNK_SIZE    = 500
 CHUNK_OVERLAP = 50
@@ -51,7 +53,6 @@ CHAPTERS = {
     "hecu1cc.pdf": "Ch 14 — Chemical Effects of Electric Current",
     "hecu1ps.pdf": "Ch 15 — Some Natural Phenomena",
 }
-
 CHAPTER_LIST = list(CHAPTERS.values())
 
 MOTIVATIONAL_QUOTES = [
@@ -86,8 +87,7 @@ def log_interaction(sid, sname, mode, chapter, question, rlen):
             (sid, sname, datetime.datetime.now().isoformat(), mode, chapter, question[:200], rlen))
         conn.commit()
         conn.close()
-    except:
-        pass
+    except: pass
 
 def log_quiz(sid, sname, chapter, score, total):
     pct = (score/total)*100 if total else 0
@@ -98,19 +98,18 @@ def log_quiz(sid, sname, chapter, score, total):
             (sid, sname, datetime.datetime.now().isoformat(), chapter, score, total, level))
         conn.commit()
         conn.close()
-    except:
-        pass
+    except: pass
     return level
 
 def get_competency(sid, chapter):
     try:
         conn = sqlite3.connect(DB_PATH)
-        row = conn.execute("SELECT competency_level FROM quiz_results WHERE student_id=? AND chapter=? ORDER BY timestamp DESC LIMIT 1",
+        row = conn.execute(
+            "SELECT competency_level FROM quiz_results WHERE student_id=? AND chapter=? ORDER BY timestamp DESC LIMIT 1",
             (sid, chapter)).fetchone()
         conn.close()
         return row[0] if row else "Not Started"
-    except:
-        return "Not Started"
+    except: return "Not Started"
 
 def get_analytics():
     try:
@@ -132,12 +131,17 @@ def get_analytics():
 @st.cache_resource(show_spinner="📚 Indexing textbook — one-time setup, please wait...")
 def build_retriever():
     embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
-    chroma_path = Path(CHROMA_DIR)
+    faiss_path = Path(FAISS_DIR)
 
-    if chroma_path.exists() and any(chroma_path.iterdir()):
-        vs = FAISS.load_local(CHROMA_DIR, embeddings, allow_dangerous_deserialization=True)
+    # Reload from disk if already built
+    if faiss_path.exists() and (faiss_path / "index.faiss").exists():
+        vs = FAISS.load_local(
+            FAISS_DIR, embeddings,
+            allow_dangerous_deserialization=True
+        )
         return vs.as_retriever(search_kwargs={"k": NUM_CHUNKS})
 
+    # Load PDFs
     pdf_dir = Path(PDF_DIR)
     if not pdf_dir.exists():
         pdf_dir.mkdir(parents=True)
@@ -146,7 +150,7 @@ def build_retriever():
 
     pdf_files = list(pdf_dir.glob("*.pdf"))
     if not pdf_files:
-        st.error(f"No PDFs in '{PDF_DIR}/'. Add chapter PDFs and restart.")
+        st.error(f"No PDFs found in '{PDF_DIR}/'. Add chapter PDFs and restart.")
         st.stop()
 
     raw_pages = []
@@ -159,21 +163,17 @@ def build_retriever():
         raw_pages.extend(pages)
         prog.progress((i+1)/len(pdf_files), text=f"Loading {p.name}...")
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+    )
     chunks = splitter.split_documents(raw_pages)
 
-    # Build FAISS index from all chunks
-    vs = None
-    batch_size = 5000
-    for i in range(0, len(chunks), batch_size):
-        batch = chunks[i:i+batch_size]
-        if vs is None:
-            vs = FAISS.from_documents(chunks, embeddings)
-            vs.save_local(CHROMA_DIR)
-        else:
-            vs.add_documents(batch)
-
+    # Build FAISS index (no batch limit issues!)
+    prog.progress(0.9, text="Building search index...")
+    vs = FAISS.from_documents(chunks, embeddings)
+    vs.save_local(FAISS_DIR)
     prog.empty()
+
     return vs.as_retriever(search_kwargs={"k": NUM_CHUNKS})
 
 def get_chapter_badges(docs):
@@ -194,19 +194,20 @@ def build_qa_chain(_retriever):
         input_variables=["context", "question"],
         template="""You are LearnIQ, a warm Socratic science tutor for CBSE Grade 8.
 
-STRICT RULE: Only answer from the context below. If not found, say "I couldn't find this in your textbook. Please ask your teacher!"
+STRICT RULE: Only answer from the context below.
+If not found say: "I couldn't find this in your textbook. Please ask your teacher!"
 
-TEACHING SEQUENCE (follow every time):
-1. Give the core fact simply (1-2 sentences)
-2. Explain WHY/HOW with a simple analogy
-3. Give one real-life example a Class 8 student can relate to
-4. Ask ONE simple check question — then STOP and wait for student's answer
+TEACHING SEQUENCE:
+1. State the core fact simply (1-2 sentences)
+2. Explain WHY/HOW with a simple real-life analogy
+3. Give one concrete real-life example
+4. Ask ONE simple check question — then STOP and wait
 
-Keep language warm, encouraging, age-appropriate. Use bold for key terms. End with 🌟 and a motivating line.
+Use bold for key terms. Keep language warm. End with 🌟
 
 Context: {context}
 Student question: {question}
-Your response:"""
+Response:"""
     )
     return RetrievalQA.from_chain_type(
         llm=get_llm(), chain_type="stuff", retriever=_retriever,
@@ -215,15 +216,17 @@ Your response:"""
 
 def llm_call(system, user):
     llm = get_llm()
-    return llm.invoke([SystemMessage(content=system), HumanMessage(content=user)]).content
+    return llm.invoke([
+        SystemMessage(content=system),
+        HumanMessage(content=user)
+    ]).content
 
 # ─── TUTOR MODE ────────────────────────────────────────────────────────────
 def page_tutor(qa_chain, sid, sname):
     st.markdown('<div class="mode-card tutor-card"><span class="mode-icon">🎓</span><div><div class="mode-title">Personalized Tutor</div><div class="mode-desc">Ask me anything from your Science textbook!</div></div></div>', unsafe_allow_html=True)
 
-    if "msgs" not in st.session_state:      st.session_state.msgs = []
-    if "fup_count" not in st.session_state: st.session_state.fup_count = 0
-    if "cur_ch" not in st.session_state:    st.session_state.cur_ch = ""
+    for k,v in [("msgs",[]),("fup_count",0),("cur_ch","")]:
+        if k not in st.session_state: st.session_state[k] = v
 
     for msg in st.session_state.msgs:
         with st.chat_message(msg["role"], avatar="🧑‍🎓" if msg["role"]=="user" else "🤖"):
@@ -234,22 +237,22 @@ def page_tutor(qa_chain, sid, sname):
     user_input = st.chat_input("Type your Science question here... 💬")
 
     if user_input:
-        # Off-topic check
         sci_words = ["what","why","how","explain","define","cell","force","sound","crop",
                      "micro","fibre","metal","coal","fire","plant","animal","friction",
-                     "electric","reproduce","adolescence","chapter","science","atom","energy"]
+                     "electric","reproduce","adolescence","chapter","science","atom","energy",
+                     "heat","light","water","soil","food","air","pressure","wave","current"]
         is_offtopic = not any(w in user_input.lower() for w in sci_words) and len(user_input.split()) < 5
 
         if is_offtopic:
             q, a = random.choice(MOTIVATIONAL_QUOTES)
-            reply = f"{q}\n*{a}*\n\n😄 Looks like a little detour! That's okay — but your Science book has amazing things waiting! Let's get back — what topic shall we explore? 🚀"
+            reply = f"{q}\n*{a}*\n\n😄 Looks like a little detour! That's okay — but your Science book has amazing things waiting! What topic shall we explore? 🚀"
             st.session_state.msgs.append({"role":"user","content":user_input})
             st.session_state.msgs.append({"role":"assistant","content":reply,"badges":[]})
             st.rerun()
             return
 
         if st.session_state.fup_count >= MAX_FOLLOWUPS:
-            reply = "😊 Great questions today! We've gone deep on this topic. For any remaining doubts, please ask your teacher — they'll love your curiosity! 👩‍🏫\n\nShall we explore a **new topic**? Just type away! 🌟"
+            reply = "😊 Great questions today! We've explored this topic deeply. For remaining doubts, please ask your teacher — they'll love your curiosity! 👩‍🏫\n\nShall we explore a **new topic**? 🌟"
             st.session_state.fup_count = 0
             st.session_state.msgs.append({"role":"user","content":user_input})
             st.session_state.msgs.append({"role":"assistant","content":reply,"badges":[]})
@@ -257,64 +260,40 @@ def page_tutor(qa_chain, sid, sname):
             return
 
         with st.spinner("🤔 Thinking..."):
-            # Build conversation history for context-aware dialogue
-            # This lets the tutor evaluate student's answer to its own check question
+            # Build conversation history
             history_text = ""
-            for m in st.session_state.msgs[-6:]:   # last 3 exchanges
+            for m in st.session_state.msgs[-6:]:
                 role = "Student" if m["role"] == "user" else "Tutor"
-                history_text += f"{role}: {m['content']}\n\n"
+                history_text += f"{role}: {m['content'][:300]}\n\n"
 
-            # Retrieve relevant context from textbook
+            # Retrieve context
             docs = qa_chain.retriever.invoke(user_input)
             context = "\n\n".join([d.page_content for d in docs]) if docs else ""
             badges = get_chapter_badges(docs)
 
-            # Build a conversation-aware prompt
-            is_answering = len(st.session_state.msgs) > 0 and \
-                           st.session_state.msgs[-1]["role"] == "assistant" and \
-                           "?" in st.session_state.msgs[-1]["content"]
+            # Check if student is answering tutor's question
+            is_answering = (len(st.session_state.msgs) > 0 and
+                           st.session_state.msgs[-1]["role"] == "assistant" and
+                           "?" in st.session_state.msgs[-1]["content"])
 
             if is_answering:
-                # Student is answering the tutor's check question — evaluate it!
-                system_prompt = """You are LearnIQ, a warm Socratic science tutor for CBSE Grade 8.
-The student has just answered your check question. Do the following:
-1. ✅ or ❌ — Tell them clearly if their answer is correct or not
-2. If wrong: gently correct with the right answer and a simple explanation
-3. If right: praise them warmly and add one interesting extra fact
-4. Give a REAL-LIFE example that connects to this concept
-5. Then ask ONE new build-up question to take them to the next level — STOP and wait
-Keep it warm, encouraging, age-appropriate. Use bold for key terms. End with 🌟"""
-
-                user_prompt = f"""Conversation so far:
-{history_text}
-Student's latest answer: {user_input}
-
-Textbook context:
-{context}
-
-Evaluate the student's answer and continue the Socratic dialogue:"""
+                system_p = """You are LearnIQ, a warm Socratic science tutor for CBSE Grade 8.
+The student just answered your check question. Do this:
+1. ✅ or ❌ — Tell them clearly if correct or not
+2. If wrong: gently correct with the right answer and simple explanation
+3. If right: praise warmly and add one interesting extra fact
+4. Give a REAL-LIFE example connecting to this concept
+5. Ask ONE new build-up question to go deeper — then STOP and wait
+Keep it warm, encouraging, age-appropriate. Bold key terms. End with 🌟"""
+                user_p = f"Conversation:\n{history_text}\nStudent's answer: {user_input}\n\nTextbook context:\n{context}\n\nEvaluate and continue:"
             else:
-                # New question from student
-                system_prompt = """You are LearnIQ, a warm Socratic science tutor for CBSE Grade 8.
-STRICT RULE: Only answer from the textbook context below.
-If not found, say: "I couldn't find this in your textbook. Please ask your teacher!"
+                system_p = """You are LearnIQ, a warm Socratic science tutor for CBSE Grade 8.
+STRICT: Only answer from textbook context. If not found say so.
+SEQUENCE: 1) Core fact 2) WHY/HOW with analogy 3) Real-life example 4) ONE check question then STOP.
+Bold key terms. Warm language. End with 🌟"""
+                user_p = f"Textbook context:\n{context}\n\nStudent question: {user_input}\n\nResponse:"
 
-TEACHING SEQUENCE:
-1. State the core fact simply (1-2 sentences)
-2. Explain WHY/HOW with a fun real-life analogy a Class 8 student knows
-3. Give one concrete real-life example
-4. Ask ONE simple check question — then STOP and wait for the student's answer
-
-Use bold for key terms. Keep language warm and encouraging. End with 🌟"""
-
-                user_prompt = f"""Textbook context:
-{context}
-
-Student's question: {user_input}
-
-Respond using the teaching sequence:"""
-
-            answer = llm_call(system_prompt, user_prompt)
+            answer = llm_call(system_p, user_p)
 
         if st.session_state.cur_ch and badges and any(b in st.session_state.cur_ch for b in badges):
             st.session_state.fup_count += 1
@@ -345,10 +324,8 @@ def page_summary(retriever, sid, sname):
             context = "\n\n".join([d.page_content for d in docs]) if docs else "No context found."
 
             summary = llm_call(
-                "You are a textbook summarizer for CBSE Grade 8 Science. Be factual, structured, and clear. No Bloom's Taxonomy. No questions. No tutoring. Only summarize.",
-                f"""Using this context from the textbook, write a one-page summary of: "{chapter}"
-
-Structure EXACTLY as follows (use these exact headings):
+                "You are a textbook summarizer for CBSE Grade 8 Science. Be factual and structured. No Bloom's Taxonomy. No questions. No tutoring. Only summarize.",
+                f"""Write a one-page summary of "{chapter}" using this textbook context.
 
 ## 📚 {chapter}
 
@@ -356,39 +333,37 @@ Structure EXACTLY as follows (use these exact headings):
 (2-3 sentence overview)
 
 ### 📌 Key Concepts
-(6-8 bullet points, each concept with a one-line explanation)
+(6-8 bullet points with one-line explanations)
 
 ### 📖 Important Definitions
-(5-6 key terms and their definitions)
+(5-6 key terms and definitions)
 
 ### ⚡ Must-Remember Facts
 (5-6 important exam facts)
 
 ### 🌍 Real-Life Examples
-(2-3 everyday examples linked to chapter concepts)
+(2-3 everyday examples)
 
 ### ⚠️ Common Mistakes to Avoid
-(3-4 things students often get wrong, with correct explanation)
+(3-4 misconceptions with correct explanations)
 
 ### 📝 Exam Tips
-(2-3 tips for answering exam questions on this chapter)
+(2-3 tips)
 
-Textbook context:
-{context}"""
+Context: {context}"""
             )
 
         log_interaction(sid, sname, "Summary", chapter, "summary", len(summary))
         st.markdown(summary)
         if docs:
-            badges = get_chapter_badges(docs)
-            st.markdown(" ".join(f'<span class="badge">{b}</span>' for b in badges), unsafe_allow_html=True)
+            st.markdown(" ".join(f'<span class="badge">{b}</span>' for b in get_chapter_badges(docs)), unsafe_allow_html=True)
         st.download_button("⬇️ Download Summary", data=summary,
-            file_name=f"Summary_{chapter[:25].replace(' ','_')}.md", mime="text/markdown",
-            use_container_width=True)
+            file_name=f"Summary_{chapter[:25].replace(' ','_')}.md",
+            mime="text/markdown", use_container_width=True)
 
 # ─── PROJECTS MODE ─────────────────────────────────────────────────────────
 def page_projects(qa_chain, sid, sname):
-    st.markdown('<div class="mode-card projects-card-hdr"><span class="mode-icon">🔬</span><div><div class="mode-title">Practical Projects Master</div><div class="mode-desc">Safe, fun experiments to master concepts at home or school</div></div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="mode-card projects-card-hdr"><span class="mode-icon">🔬</span><div><div class="mode-title">Practical Projects Master</div><div class="mode-desc">Safe, fun experiments to master concepts</div></div></div>', unsafe_allow_html=True)
 
     c1, c2 = st.columns(2)
     chapter  = c1.selectbox("📚 Chapter", CHAPTER_LIST, key="proj_ch")
@@ -396,47 +371,37 @@ def page_projects(qa_chain, sid, sname):
 
     if st.button("🚀 Generate Projects", use_container_width=True):
         with st.spinner("🔭 Creating project ideas..."):
-            result = qa_chain.invoke({"query":
-                f"What are the main concepts and activities in {chapter}? "
-                f"List materials, experiments and hands-on activities from the chapter."
-            })
+            result = qa_chain.invoke({"query": f"Main concepts and activities in {chapter}"})
             context = result["result"]
             projects = llm_call(
-                "You create safe, practical science projects for Class 8 students in India. Be specific, simple, and encouraging.",
-                f"""Create 3 safe projects for "{chapter}" that can be done at {location}.
+                "You create safe practical science projects for Class 8 students in India.",
+                f"""Create 3 safe projects for "{chapter}" doable at {location}.
 
 For EACH project:
-### 🔬 Project [N]: [Project Name]
-**Concept it teaches:** (link to chapter concept)
-**🎯 What you will learn:** (1-2 sentences)
-**🧰 Materials needed:** (simple, available in India, safe for Class 8)
-**📋 Steps:**
-1. (step 1)
-2. (step 2)
-... (5-7 steps)
-**👀 What to observe:** (what the student should notice)
-**💡 Science behind it:** (simple explanation linking to textbook)
-**🌟 Cool extension:** (one creative twist)
+### 🔬 Project [N]: [Name]
+**Concept:** (chapter link)
+**🎯 You will learn:** (1-2 sentences)
+**🧰 Materials:** (simple, safe, available in India)
+**📋 Steps:** (5-7 numbered steps)
+**👀 Observe:** (what to notice)
+**💡 Science behind it:** (textbook link)
+**🌟 Extension:** (creative twist)
 
-Make all projects safe, fun, and doable with household/school items.
-Chapter context: {context}"""
+Context: {context}"""
             )
-
         log_interaction(sid, sname, "Projects", chapter, "projects", len(projects))
         st.markdown(projects)
-        st.download_button("⬇️ Download Project Brief", data=projects,
-            file_name=f"Projects_{chapter[:25].replace(' ','_')}.md", mime="text/markdown",
-            use_container_width=True)
+        st.download_button("⬇️ Download Projects", data=projects,
+            file_name=f"Projects_{chapter[:25].replace(' ','_')}.md",
+            mime="text/markdown", use_container_width=True)
 
 # ─── QUIZ MODE ─────────────────────────────────────────────────────────────
 def page_quiz(sid, sname):
     st.markdown('<div class="mode-card quiz-card-hdr"><span class="mode-icon">🏆</span><div><div class="mode-title">Quiz Master</div><div class="mode-desc">6 questions across Bloom\'s Taxonomy levels</div></div></div>', unsafe_allow_html=True)
 
-    # Init state
     for k,v in [("qstate","select"),("qqns",[]),("qans",{}),("qch",""),("qres",None)]:
         if k not in st.session_state: st.session_state[k] = v
 
-    # ── SELECT ──
     if st.session_state.qstate == "select":
         chapter = st.selectbox("📚 Choose Chapter", CHAPTER_LIST, key="quiz_ch_sel")
         level_icons = {"Not Started":"⚪","Basic":"🔴","Good":"🟡","Proficient":"🟢","Master":"🏆"}
@@ -446,25 +411,24 @@ def page_quiz(sid, sname):
         if st.button("🎯 Start Quiz!", use_container_width=True):
             with st.spinner("🎲 Generating quiz..."):
                 raw = llm_call(
-                    "Return ONLY valid JSON. No markdown. No extra text. Just the JSON object.",
-                    f"""Create 6 quiz questions for "{chapter}" (CBSE Grade 8 Science).
-One question per Bloom's level: Remember, Understand, Apply, Analyse, Evaluate, Create.
-Return this exact JSON:
+                    "Return ONLY valid JSON. No markdown. No extra text.",
+                    f"""Create 6 quiz questions for "{chapter}" (CBSE Grade 8).
+One per Bloom's level: Remember, Understand, Apply, Analyse, Evaluate, Create.
+JSON format:
 {{"questions":[{{"level":"Remember","question":"...","options":["A) ...","B) ...","C) ...","D) ..."],"correct":"A","explanation":"..."}}]}}
-Vary correct answers. Make questions clear and appropriate for Class 8."""
+Vary correct answers. Clear questions for Class 8."""
                 )
             try:
                 clean = raw.strip().replace("```json","").replace("```","").strip()
                 data = json.loads(clean)
-                st.session_state.qqns  = data["questions"]
-                st.session_state.qans  = {}
-                st.session_state.qch   = chapter
+                st.session_state.qqns = data["questions"]
+                st.session_state.qans = {}
+                st.session_state.qch  = chapter
                 st.session_state.qstate = "active"
                 st.rerun()
             except Exception as e:
                 st.error(f"Quiz generation failed, please try again. ({e})")
 
-    # ── ACTIVE ──
     elif st.session_state.qstate == "active":
         st.markdown(f"### 📝 {st.session_state.qch}")
         bloom_icons = {"Remember":"🔵","Understand":"🟢","Apply":"🟡","Analyse":"🟠","Evaluate":"🔴","Create":"🟣"}
@@ -474,16 +438,14 @@ Vary correct answers. Make questions clear and appropriate for Class 8."""
                 icon = bloom_icons.get(q.get("level",""), "⚪")
                 st.markdown(f'<div class="qbox"><span class="bloom-pill">{icon} {q.get("level","")}</span><br><strong>Q{i+1}. {q["question"]}</strong></div>', unsafe_allow_html=True)
                 st.session_state.qans[i] = st.radio(
-                    f"q{i}", q.get("options",[]), key=f"qr_{i}",
-                    index=None,                          # ← no pre-selection
+                    f"q{i}", q.get("options",[]),
+                    key=f"qr_{i}", index=None,
                     label_visibility="collapsed")
                 st.markdown("---")
             submitted = st.form_submit_button("📊 Submit Answers", use_container_width=True)
 
         if submitted:
-            # Check all questions answered
-            unanswered = [i+1 for i in range(len(st.session_state.qqns))
-                          if not st.session_state.qans.get(i)]
+            unanswered = [i+1 for i in range(len(st.session_state.qqns)) if not st.session_state.qans.get(i)]
             if unanswered:
                 st.warning(f"Please answer all questions! Missing: Q{', Q'.join(map(str,unanswered))}")
             else:
@@ -491,11 +453,12 @@ Vary correct answers. Make questions clear and appropriate for Class 8."""
                 results = []
                 for i, q in enumerate(st.session_state.qqns):
                     chosen = st.session_state.qans.get(i,"")
-                    correct_letter = q.get("correct","A")
-                    ok = chosen.startswith(correct_letter + ")")
+                    cl = q.get("correct","A")
+                    ok = chosen.startswith(cl + ")")
                     if ok: score += 1
                     results.append({"q":q["question"],"level":q.get("level",""),
-                        "chosen":chosen,"correct":next((o for o in q["options"] if o.startswith(correct_letter+")")),chosen),
+                        "chosen":chosen,
+                        "correct":next((o for o in q["options"] if o.startswith(cl+")")),chosen),
                         "explanation":q.get("explanation",""),"ok":ok})
                 comp = log_quiz(sid, sname, st.session_state.qch, score, 6)
                 log_interaction(sid, sname, "Quiz", st.session_state.qch, f"score:{score}/6", score)
@@ -507,7 +470,6 @@ Vary correct answers. Make questions clear and appropriate for Class 8."""
             st.session_state.qstate = "select"
             st.rerun()
 
-    # ── RESULTS ──
     elif st.session_state.qstate == "results":
         d = st.session_state.qres
         pct = int((d["score"]/6)*100)
@@ -516,7 +478,7 @@ Vary correct answers. Make questions clear and appropriate for Class 8."""
         msg = next(v for k,v in sorted(msgs.items(),reverse=True) if pct>=k)
 
         st.markdown(f"""
-        <div style="background:white;border:3px solid {col};border-radius:20px;padding:2rem;text-align:center;margin:1rem 0;">
+        <div style="background:white;border:3px solid {col};border-radius:20px;padding:2rem;text-align:center;margin:1rem 0">
             <div style="font-size:3rem;font-weight:900;color:{col}">{d['score']}/6</div>
             <div style="font-size:1.1rem;font-weight:700;color:#1a1a2e">{pct}% — {d['comp']}</div>
             <div style="color:#475569;font-size:0.85rem">{st.session_state.qch}</div>
@@ -532,10 +494,10 @@ Vary correct answers. Make questions clear and appropriate for Class 8."""
             st.markdown(f'<div style="background:{bg};border-radius:10px;padding:12px 16px;margin-bottom:8px;color:#1a1a2e;border:1px solid #e2e8f0">{icon} <strong>Q{i+1} ({r["level"]}):</strong> {r["q"]}<br>Your answer: <em>{r["chosen"]}</em>{correct_line}<br>💡 {r["explanation"]}</div>', unsafe_allow_html=True)
 
         c1, c2 = st.columns(2)
-        if c1.button("🔄 Retake (new questions)", use_container_width=True):
+        if c1.button("🔄 Retake Quiz", use_container_width=True):
             st.session_state.qstate = "select"
             st.rerun()
-        if c2.button("📋 Study this Chapter", use_container_width=True):
+        if c2.button("📋 Study Chapter", use_container_width=True):
             st.session_state.qstate = "select"
             st.session_state.active_mode = "📋 Summary Master"
             st.rerun()
@@ -560,7 +522,7 @@ def page_teacher():
     c1,c2,c3 = st.columns(3)
     c1.metric("👥 Students", data["total_students"])
     c2.metric("💬 Interactions", data["total_interactions"])
-    c3.metric("📚 Chapters Used", len(data["chapter_access"]))
+    c3.metric("📚 Chapters", len(data["chapter_access"]))
     st.markdown("---")
 
     if data["chapter_access"]:
@@ -588,173 +550,87 @@ def page_teacher():
 
 # ─── MAIN ──────────────────────────────────────────────────────────────────
 def main():
-    st.set_page_config(page_title="LearnIQ", page_icon="🔬", layout="wide",
-                       initial_sidebar_state="expanded")
+    st.set_page_config(page_title="LearnIQ", page_icon="🔬",
+                       layout="wide", initial_sidebar_state="expanded")
 
-    # ── CSS ────────────────────────────────────────────────────────────────
     st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Baloo+2:wght@700;800&family=Nunito:wght@400;600;700&display=swap');
 
-    /* BASE */
     html, body, .stApp { background:#f1f5f9 !important; }
-    .stApp { font-family: 'Nunito', sans-serif !important; }
-
-    /* MAIN AREA — light bg, always dark text */
+    .stApp { font-family:'Nunito',sans-serif !important; }
     .main .block-container { background:#f1f5f9 !important; max-width:900px; }
-    .stMarkdown, .stMarkdown p, .stMarkdown li, .stMarkdown h1,
-    .stMarkdown h2, .stMarkdown h3, .stMarkdown h4,
-    p, li, span { color:#1e293b !important; }
 
-    /* CHAT MESSAGES */
+    .stMarkdown p, .stMarkdown li, .stMarkdown h1,
+    .stMarkdown h2, .stMarkdown h3, .stMarkdown h4,
+    p, li { color:#1e293b !important; }
+
     [data-testid="stChatMessage"] {
-        background:#ffffff !important;
-        border:1px solid #cbd5e1 !important;
-        border-radius:14px !important;
-        margin-bottom:8px !important;
+        background:#ffffff !important; border:1px solid #cbd5e1 !important;
+        border-radius:14px !important; margin-bottom:8px !important;
     }
     [data-testid="stChatMessage"] p,
     [data-testid="stChatMessage"] li { color:#1e293b !important; }
 
-    /* MODE HEADER CARDS */
-    .mode-card {
-        display:flex; align-items:center; gap:1rem;
-        padding:1rem 1.5rem; border-radius:16px;
-        margin-bottom:1.5rem;
-    }
-    .mode-icon { font-size:2rem; }
+    .mode-card { display:flex; align-items:center; gap:1rem;
+        padding:1rem 1.5rem; border-radius:16px; margin-bottom:1.5rem; }
+    .mode-icon  { font-size:2rem; }
     .mode-title { font-family:'Baloo 2',cursive; font-size:1.5rem; font-weight:800; }
     .mode-desc  { font-size:0.85rem; font-weight:600; margin-top:2px; }
-    .tutor-card       { background:#1e3a5f; }
+    .tutor-card        { background:#1e3a5f; }
     .tutor-card .mode-title, .tutor-card .mode-desc { color:#bfdbfe !important; }
-    .summary-card-hdr { background:#14532d; }
+    .summary-card-hdr  { background:#14532d; }
     .summary-card-hdr .mode-title, .summary-card-hdr .mode-desc { color:#bbf7d0 !important; }
-    .projects-card-hdr{ background:#78350f; }
+    .projects-card-hdr { background:#78350f; }
     .projects-card-hdr .mode-title, .projects-card-hdr .mode-desc { color:#fde68a !important; }
-    .quiz-card-hdr    { background:#3b0764; }
+    .quiz-card-hdr     { background:#3b0764; }
     .quiz-card-hdr .mode-title, .quiz-card-hdr .mode-desc { color:#ede9fe !important; }
-    .teacher-card-hdr { background:#7f1d1d; }
+    .teacher-card-hdr  { background:#7f1d1d; }
     .teacher-card-hdr .mode-title, .teacher-card-hdr .mode-desc { color:#fee2e2 !important; }
 
-    /* BADGES */
-    .badge {
-        display:inline-block; background:#1e3a5f; color:#bfdbfe !important;
+    .badge { display:inline-block; background:#1e3a5f; color:#bfdbfe !important;
         font-size:0.72rem; font-weight:700; padding:3px 10px;
-        border-radius:20px; margin:3px 3px 0 0;
-    }
+        border-radius:20px; margin:3px 3px 0 0; }
 
-    /* QUIZ BOX */
-    .qbox {
-        background:#ffffff; border:2px solid #e2e8f0;
-        border-radius:12px; padding:14px 18px;
-        margin-bottom:10px; color:#1e293b !important;
-    }
-    .bloom-pill {
-        display:inline-block; background:#1e3a5f; color:#bfdbfe !important;
-        border-radius:8px; padding:2px 10px;
-        font-size:0.75rem; font-weight:700; margin-bottom:8px;
-    }
+    .qbox { background:#ffffff; border:2px solid #e2e8f0; border-radius:12px;
+        padding:14px 18px; margin-bottom:10px; color:#1e293b !important; }
+    .bloom-pill { display:inline-block; background:#1e3a5f; color:#bfdbfe !important;
+        border-radius:8px; padding:2px 10px; font-size:0.75rem;
+        font-weight:700; margin-bottom:8px; }
 
-    /* MAIN BUTTONS */
     .stButton > button {
         background:#1e3a5f !important; color:#ffffff !important;
         border:none !important; border-radius:10px !important;
-        font-weight:700 !important; font-size:0.95rem !important;
-        padding:0.55rem 1.2rem !important;
-        width:100% !important;
-        cursor:pointer !important;
+        font-weight:700 !important; width:100% !important; cursor:pointer !important;
     }
-    .stButton > button:hover {
-        background:#0f3460 !important;
-        transform:translateY(-1px);
-    }
+    .stButton > button:hover { background:#0f3460 !important; }
 
-    /* SELECT BOXES in main area */
     .stSelectbox label { color:#1e293b !important; font-weight:700 !important; }
     .stSelectbox [data-baseweb="select"] > div {
         background:#ffffff !important; color:#1e293b !important;
-        border:2px solid #cbd5e1 !important; border-radius:10px !important;
-    }
+        border:2px solid #cbd5e1 !important; border-radius:10px !important; }
 
-    /* CHAT INPUT */
-    .stChatInput textarea { color:#1e293b !important; background:#ffffff !important; }
-
-    /* ── SIDEBAR ── */
-    section[data-testid="stSidebar"] {
-        background:#0f172a !important;
-    }
-    /* ALL sidebar text — white */
-    section[data-testid="stSidebar"] *,
-    section[data-testid="stSidebar"] p,
-    section[data-testid="stSidebar"] span,
-    section[data-testid="stSidebar"] label,
-    section[data-testid="stSidebar"] div,
-    section[data-testid="stSidebar"] h3 {
-        color:#e2e8f0 !important;
-    }
-    /* Sidebar heading */
-    section[data-testid="stSidebar"] h3 {
-        color:#7dd3fc !important;
-    }
-    /* Sidebar input */
+    section[data-testid="stSidebar"] { background:#0f172a !important; }
+    section[data-testid="stSidebar"] * { color:#e2e8f0 !important; }
+    section[data-testid="stSidebar"] h3 { color:#7dd3fc !important; }
     section[data-testid="stSidebar"] input {
-        background:#1e293b !important;
-        color:#ffffff !important;
-        border:1px solid #334155 !important;
-        border-radius:8px !important;
-    }
-    /* Sidebar selectbox */
+        background:#1e293b !important; color:#ffffff !important;
+        border:1px solid #334155 !important; border-radius:8px !important; }
     section[data-testid="stSidebar"] [data-baseweb="select"] > div {
-        background:#1e293b !important;
-        color:#ffffff !important;
-        border:1px solid #334155 !important;
-    }
-    section[data-testid="stSidebar"] [data-baseweb="select"] svg { fill:#ffffff !important; }
-    section[data-testid="stSidebar"] [data-baseweb="menu"] {
-        background:#1e293b !important;
-    }
-    section[data-testid="stSidebar"] [data-baseweb="menu"] li {
-        color:#e2e8f0 !important;
-    }
-    /* Sidebar buttons */
+        background:#1e293b !important; color:#ffffff !important;
+        border:1px solid #334155 !important; }
     section[data-testid="stSidebar"] .stButton > button {
-        background:#1e293b !important;
-        color:#e2e8f0 !important;
-        border:1px solid #334155 !important;
-        border-radius:10px !important;
-        font-weight:600 !important;
-        width:100% !important;
-    }
+        background:#1e293b !important; color:#e2e8f0 !important;
+        border:1px solid #334155 !important; border-radius:10px !important; }
     section[data-testid="stSidebar"] .stButton > button:hover {
-        background:#334155 !important;
-        color:#7dd3fc !important;
-        border-color:#7dd3fc !important;
-    }
-    /* Active nav button */
-    section[data-testid="stSidebar"] .stButton > button[data-active="true"],
-    section[data-testid="stSidebar"] .active-nav-btn > button {
-        background:#1e3a5f !important;
-        color:#7dd3fc !important;
-        border-color:#7dd3fc !important;
-    }
-
-    /* DIVIDER */
-    hr { border-color:#334155 !important; }
-
-    /* METRICS */
-    [data-testid="metric-container"] label { color:#475569 !important; }
-    [data-testid="metric-container"] [data-testid="stMetricValue"] { color:#1e293b !important; }
-
-    /* WARNINGS / INFO */
-    .stAlert p { color:#1e293b !important; }
+        background:#334155 !important; color:#7dd3fc !important; }
     </style>
     """, unsafe_allow_html=True)
 
     init_db()
 
-    # ── SESSION STATE ──────────────────────────────────────────────────────
-    for k, v in [("logged_in",False),("student_name",""),("student_id",""),
-                  ("active_mode","🎓 Tutor Mode")]:
+    for k,v in [("logged_in",False),("student_name",""),
+                ("student_id",""),("active_mode","🎓 Tutor Mode")]:
         if k not in st.session_state: st.session_state[k] = v
 
     # ── SIDEBAR ────────────────────────────────────────────────────────────
@@ -769,7 +645,6 @@ def main():
         """, unsafe_allow_html=True)
         st.markdown("---")
 
-        # Login / student card
         if not st.session_state.logged_in:
             st.markdown("### 👤 Who's learning?")
             name  = st.text_input("Your Name", placeholder="e.g. Arjun Sharma")
@@ -777,8 +652,9 @@ def main():
             if st.button("🚀 Start Learning!"):
                 if name.strip():
                     st.session_state.student_name = name.strip()
-                    st.session_state.student_id   = hashlib.md5(f"{name.strip()}{grade}".encode()).hexdigest()[:10]
-                    st.session_state.logged_in    = True
+                    st.session_state.student_id = hashlib.md5(
+                        f"{name.strip()}{grade}".encode()).hexdigest()[:10]
+                    st.session_state.logged_in = True
                     st.rerun()
                 else:
                     st.warning("Please enter your name!")
@@ -798,34 +674,28 @@ def main():
         st.markdown("---")
         st.markdown("### 📚 Modes")
 
-        MODES = ["🎓 Tutor Mode","📋 Summary Master","🔬 Projects Master",
-                 "🏆 Quiz Master","👩‍🏫 Teacher Dashboard"]
-
-        for m in MODES:
-            # Use on_click pattern to avoid type= issues
+        for m in ["🎓 Tutor Mode","📋 Summary Master","🔬 Projects Master",
+                  "🏆 Quiz Master","👩‍🏫 Teacher Dashboard"]:
             if st.button(m, key=f"nav_{m}"):
                 st.session_state.active_mode = m
                 st.rerun()
 
-        # Show active mode indicator
         st.markdown(f"""
         <div style="background:#1e3a5f;border-radius:8px;padding:6px 12px;margin-top:8px;
                     color:#7dd3fc;font-size:0.8rem;font-weight:700;border:1px solid #2563eb">
-            ✅ Active: {st.session_state.active_mode}
+            ✅ {st.session_state.active_mode}
         </div>
         """, unsafe_allow_html=True)
 
         st.markdown("---")
-        st.markdown("### 💰 Usage")
         st.caption(f"Model: {LLM_MODEL}")
-        st.caption(f"Embed: {EMBED_MODEL}")
         st.caption("~$0.0005 per question")
 
-    # ── NOT LOGGED IN — LANDING ─────────────────────────────────────────────
+    # ── LANDING ────────────────────────────────────────────────────────────
     if not st.session_state.logged_in:
         st.markdown("""
         <div style="background:linear-gradient(135deg,#1e3a5f,#0f172a);border-radius:20px;
-                    padding:2rem;margin-bottom:2rem;box-shadow:0 4px 20px rgba(0,0,0,0.15)">
+                    padding:2rem;margin-bottom:2rem">
             <div style="font-family:'Baloo 2',cursive;font-size:2.2rem;font-weight:800;color:#ffffff">
                 🔬 Learn<span style="color:#fbbf24">IQ</span>
                 <span style="color:#7dd3fc"> — Grade 8 Science</span>
@@ -838,57 +708,47 @@ def main():
 
         c1,c2,c3,c4 = st.columns(4)
         for col, icon, title, desc, bg in zip(
-            [c1,c2,c3,c4],
-            ["🎓","📋","🔬","🏆"],
+            [c1,c2,c3,c4], ["🎓","📋","🔬","🏆"],
             ["Tutor Mode","Quick Summary","Projects","Quiz Master"],
-            ["Socratic Q&A with Bloom's ladder","1-page chapter summaries",
-             "Safe home/school experiments","6-level Bloom's quizzes"],
+            ["Socratic Q&A","Chapter summaries","Safe experiments","Bloom's quizzes"],
             ["#1e3a5f","#14532d","#78350f","#3b0764"]
         ):
             col.markdown(f"""
-            <div style="background:{bg};border-radius:16px;padding:1.2rem;text-align:center;
-                        box-shadow:0 2px 12px rgba(0,0,0,0.1)">
+            <div style="background:{bg};border-radius:16px;padding:1.2rem;text-align:center">
                 <div style="font-size:2rem">{icon}</div>
                 <div style="font-family:'Baloo 2',cursive;font-weight:800;color:#ffffff;margin:6px 0">{title}</div>
                 <div style="font-size:0.8rem;color:#cbd5e1">{desc}</div>
             </div>
             """, unsafe_allow_html=True)
 
-        st.markdown("""
-        <div style="text-align:center;margin-top:2rem;color:#475569;font-weight:600">
-            👈 Enter your name in the sidebar to start!
-        </div>""", unsafe_allow_html=True)
+        st.markdown('<div style="text-align:center;margin-top:2rem;color:#475569;font-weight:600">👈 Enter your name in the sidebar to start!</div>', unsafe_allow_html=True)
         return
 
-    # ── LOGGED IN — APP HEADER ─────────────────────────────────────────────
+    # ── APP HEADER ─────────────────────────────────────────────────────────
     st.markdown(f"""
     <div style="background:linear-gradient(135deg,#1e3a5f,#0f172a);border-radius:16px;
-                padding:1.2rem 1.8rem;margin-bottom:1.5rem;box-shadow:0 4px 16px rgba(0,0,0,0.15)">
+                padding:1.2rem 1.8rem;margin-bottom:1.5rem">
         <span style="font-family:'Baloo 2',cursive;font-size:1.8rem;font-weight:800;color:#ffffff">
             🔬 Learn<span style="color:#fbbf24">IQ</span>
         </span>
         <span style="color:#7dd3fc;font-size:1.2rem;font-weight:700"> — Grade 8 Science</span>
         <div style="color:#cbd5e1;font-size:0.9rem;margin-top:4px">
-            Welcome back, <strong style="color:#fbbf24">{st.session_state.student_name}</strong>!
-            Let's explore Science today 🌟
+            Welcome back, <strong style="color:#fbbf24">{st.session_state.student_name}</strong>! 🌟
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-    # ── LOAD RETRIEVER & CHAIN ──────────────────────────────────────────────
     retriever = build_retriever()
     qa_chain  = build_qa_chain(retriever)
 
-    # ── ROUTE ──────────────────────────────────────────────────────────────
     mode = st.session_state.active_mode
     sid, sname = st.session_state.student_id, st.session_state.student_name
 
-    if   mode == "🎓 Tutor Mode":       page_tutor(qa_chain, sid, sname)
-    elif mode == "📋 Summary Master":   page_summary(retriever, sid, sname)
-    elif mode == "🔬 Projects Master":  page_projects(qa_chain, sid, sname)
-    elif mode == "🏆 Quiz Master":      page_quiz(sid, sname)
-    elif mode == "👩‍🏫 Teacher Dashboard": page_teacher()
-
+    if   mode == "🎓 Tutor Mode":          page_tutor(qa_chain, sid, sname)
+    elif mode == "📋 Summary Master":      page_summary(retriever, sid, sname)
+    elif mode == "🔬 Projects Master":     page_projects(qa_chain, sid, sname)
+    elif mode == "🏆 Quiz Master":         page_quiz(sid, sname)
+    elif mode == "👩‍🏫 Teacher Dashboard":  page_teacher()
 
 if __name__ == "__main__":
     main()
