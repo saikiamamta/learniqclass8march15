@@ -8,4 +8,4 @@ chromadb==0.4.24
 pypdf==4.0.0
 tiktoken==0.7.0
 python-dotenv==1.0.0
-openai==1.35.0
+openai==1.40.0
