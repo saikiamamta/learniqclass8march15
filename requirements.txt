@@ -4,9 +4,8 @@ langchain-openai==0.1.23
 langchain-community==0.2.16
 langchain-core==0.2.43
 langchain-text-splitters==0.2.4
-chromadb==0.4.15
+faiss-cpu==1.7.4
 pypdf==4.0.0
 tiktoken==0.7.0
 python-dotenv==1.0.0
 openai==1.40.0
-pydantic>=1.9,<2.0
