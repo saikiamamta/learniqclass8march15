@@ -34,3 +34,4 @@ outputs/
 echo "chroma_db/" >> .gitignore
 echo "__pycache__/" >> .gitignore
 echo "*.pyc" >> .gitignorepdfs/
+chroma_db_v2/
