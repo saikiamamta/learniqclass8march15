@@ -135,7 +135,7 @@ def build_retriever():
     chroma_path = Path(CHROMA_DIR)
 
     if chroma_path.exists() and any(chroma_path.iterdir()):
-        vs = Chroma(persist_directory=CHROMA_DIR, embedding_function=embeddings)
+        vs = FAISS.load_local(CHROMA_DIR, embeddings, allow_dangerous_deserialization=True)
         return vs.as_retriever(search_kwargs={"k": NUM_CHUNKS})
 
     pdf_dir = Path(PDF_DIR)
@@ -162,13 +162,14 @@ def build_retriever():
     splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
     chunks = splitter.split_documents(raw_pages)
 
-    # Batch to stay under ChromaDB 5461 limit
+    # Build FAISS index from all chunks
     vs = None
     batch_size = 5000
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i:i+batch_size]
         if vs is None:
-            vs = Chroma.from_documents(batch, embeddings, persist_directory=CHROMA_DIR)
+            vs = FAISS.from_documents(chunks, embeddings)
+            vs.save_local(CHROMA_DIR)
         else:
             vs.add_documents(batch)
 
